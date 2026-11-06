@@ -1,0 +1,81 @@
+# ==========================================
+# Renewal Relay - Root Git Ignore
+# ==========================================
+
+# Environment variables and secrets (NEVER commit secrets!)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+credentials.json
+secrets.json
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+venv/
+ENV/
+env/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Databases (Local SQLite)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+backend/*.db
+backend/*.sqlite3
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/frontend/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.local
+
+# IDE & Editor artifacts
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
