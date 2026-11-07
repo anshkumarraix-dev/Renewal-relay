@@ -6,6 +6,7 @@ Architectural Guarantees:
 - Secrets isolated to backend environment.
 - Deterministic policy enforcement for all recovery actions.
 - CORS restricted strictly to local frontend development origins.
+- Shared, managed httpx.AsyncClient lifecycle tied to application lifespan.
 """
 
 from contextlib import asynccontextmanager
@@ -13,10 +14,12 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+import httpx
 
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.core.database import init_db
+from app.core.paypal import PayPalAuthManager, PayPalRESTClient
 from app.api.v1.api import api_router
 
 # Initialize structured logging with sensitive data redaction
@@ -28,10 +31,30 @@ logger = logging.getLogger("renewal_relay.main")
 async def lifespan(app: FastAPI):
     """Application lifespan context manager for startup and shutdown events."""
     logger.info("Initializing %s v%s in %s mode...", settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT)
-    # Initialize SQLite database schema
+
+    # 1. Initialize SQLite database schema (preserved)
     init_db()
     logger.info("Database connectivity ready at %s", settings.DATABASE_URL)
+
+    # 2. Initialize application-managed PayPal HTTP client and REST services
+    app.state.paypal_http_client = httpx.AsyncClient(
+        base_url=settings.PAYPAL_BASE_URL,
+        timeout=httpx.Timeout(settings.PAYPAL_TIMEOUT_SECONDS),
+        http2=False,
+    )
+    app.state.paypal_auth_manager = PayPalAuthManager(settings=settings)
+    app.state.paypal_client = PayPalRESTClient(
+        client=app.state.paypal_http_client,
+        auth_manager=app.state.paypal_auth_manager,
+        settings=settings,
+    )
+    logger.info("Initialized managed PayPal REST client bound to %s", settings.PAYPAL_BASE_URL)
+
     yield
+
+    # 3. Cleanly close managed HTTP connection pool on shutdown
+    logger.info("Closing managed PayPal HTTP client...")
+    await app.state.paypal_http_client.aclose()
     logger.info("Shutting down %s...", settings.APP_NAME)
 
 
