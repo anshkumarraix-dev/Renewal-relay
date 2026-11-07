@@ -94,9 +94,9 @@ class Settings(BaseSettings):
     @field_validator("PAYPAL_MODE")
     @classmethod
     def validate_paypal_mode(cls, v: str) -> str:
-        mode = v.lower()
-        if mode not in ("sandbox", "live"):
-            raise ValueError("PAYPAL_MODE must be either 'sandbox' or 'live'")
+        mode = v.strip().lower()
+        if mode != "sandbox":
+            raise ValueError(f"PAYPAL_MODE must be 'sandbox'; got '{v}'. Live mode is strictly prohibited.")
         return mode
 
     @field_validator("PAYPAL_BASE_URL")

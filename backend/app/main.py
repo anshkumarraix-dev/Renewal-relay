@@ -50,12 +50,14 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Initialized managed PayPal REST client bound to %s", settings.PAYPAL_BASE_URL)
 
-    yield
-
-    # 3. Cleanly close managed HTTP connection pool on shutdown
-    logger.info("Closing managed PayPal HTTP client...")
-    await app.state.paypal_http_client.aclose()
-    logger.info("Shutting down %s...", settings.APP_NAME)
+    try:
+        yield
+    finally:
+        # 3. Cleanly close managed HTTP connection pool on shutdown, even on unhandled exceptions
+        if hasattr(app.state, "paypal_http_client") and app.state.paypal_http_client is not None:
+            logger.info("Closing managed PayPal HTTP client...")
+            await app.state.paypal_http_client.aclose()
+        logger.info("Shutting down %s...", settings.APP_NAME)
 
 
 app = FastAPI(

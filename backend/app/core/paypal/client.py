@@ -4,17 +4,16 @@ Architectural Guarantees:
 - Sandbox endpoint pinned to https://api-m.sandbox.paypal.com.
 - Operation safety classification enforced internally; caller claims validated against method and path.
 - Strictly ZERO automatic retries on any financial or subscription mutation (including on 429, 502, 503, 504, timeouts).
-- Ambiguous outcomes on mutations raise PayPalAmbiguousError containing operation safety and request_id.
+- Ambiguous outcomes on mutations (timeouts, network drops, HTTP 502/503/504) raise PayPalAmbiguousError.
 - Bounded Retry-After (supporting numeric seconds and RFC 7231 HTTP-dates) and full jitter for safe reads.
 - One-time token refresh and retry on HTTP 401 for safe reads.
+- Strict request URL validation preventing scheme-relative URLs, external hosts, embedded credentials, and queries in path.
+- Internal Authorization header protection preventing caller overrides.
 - Reuses shared httpx.AsyncClient connection pool without prematurely closing injected clients.
 """
 
 import asyncio
-import email.utils
-from datetime import datetime, timezone
 from enum import Enum
-import json
 import logging
 import random
 from typing import Optional, Dict, Any, Callable, Awaitable
@@ -30,6 +29,7 @@ from app.core.paypal.exceptions import (
     PayPalBusinessError,
     PayPalAmbiguousError,
 )
+from app.core.paypal.utils import parse_retry_after, extract_debug_id, validate_api_path
 
 logger = logging.getLogger("renewal_relay.paypal.client")
 
@@ -37,7 +37,7 @@ logger = logging.getLogger("renewal_relay.paypal.client")
 class OperationSafety(str, Enum):
     """Classification of PayPal API operations by fault-tolerance and retry safety."""
     SAFE_READ = "SAFE_READ"                          # Read-only GET requests (safe to retry on transient errors)
-    TOKEN_ACQUISITION = "TOKEN_ACQUISITION"          # POST /v1/oauth2/token (idempotent grant, limited retries)
+    TOKEN_ACQUISITION = "TOKEN_ACQUISITION"          # POST /v1/oauth2/token (idempotent grant, bounded retries)
     MUTATING_SUBSCRIPTION = "MUTATING_SUBSCRIPTION"  # POST suspend/activate/cancel/revise (state mutation)
     MUTATING_FINANCIAL = "MUTATING_FINANCIAL"        # POST capture (financial charge - strictly NO blind retries)
 
@@ -50,87 +50,36 @@ def classify_operation_safety(
     """Validate and enforce operation safety classification.
 
     Safeguard: Never trust caller-declared safety without validating HTTP method and path.
-    A caller claiming SAFE_READ for a POST /capture will be overridden to MUTATING_FINANCIAL.
+    A caller claiming SAFE_READ for a POST /capture or any non-read method will be overridden.
+    Unknown non-read operations default to non-retryable mutations.
     """
     method_upper = method.upper()
     clean_path = path.split("?")[0].rstrip("/")
 
-    # 1. Read-only methods are always SAFE_READ
-    if method_upper in ("GET", "HEAD", "OPTIONS"):
-        return OperationSafety.SAFE_READ
-
-    # 2. OAuth token endpoint is TOKEN_ACQUISITION
-    if clean_path.endswith("/v1/oauth2/token"):
-        return OperationSafety.TOKEN_ACQUISITION
-
-    # 3. Capture endpoint is MUTATING_FINANCIAL
+    # 1. Capture endpoint is always MUTATING_FINANCIAL regardless of caller claims
     if "/billing/subscriptions/" in clean_path and clean_path.endswith("/capture"):
         return OperationSafety.MUTATING_FINANCIAL
 
-    # 4. Known subscription mutation endpoints: suspend, activate, cancel, revise
+    # 2. Known subscription mutation endpoints: suspend, activate, cancel, revise
     if "/billing/subscriptions/" in clean_path and any(
         clean_path.endswith(f"/{action}") for action in ("suspend", "activate", "cancel", "revise")
     ):
         return OperationSafety.MUTATING_SUBSCRIPTION
 
-    # 5. Other non-idempotent methods default conservatively to mutating
+    # 3. Read-only methods (GET, HEAD, OPTIONS) are SAFE_READ
+    if method_upper in ("GET", "HEAD", "OPTIONS"):
+        return OperationSafety.SAFE_READ
+
+    # 4. OAuth token endpoint is TOKEN_ACQUISITION
+    if clean_path.endswith("/v1/oauth2/token"):
+        return OperationSafety.TOKEN_ACQUISITION
+
+    # 5. Non-read methods (POST, PUT, PATCH, DELETE) to unknown paths:
+    # Caller cannot downgrade a mutation to SAFE_READ.
     if declared_safety == OperationSafety.MUTATING_FINANCIAL:
         return OperationSafety.MUTATING_FINANCIAL
 
     return OperationSafety.MUTATING_SUBSCRIPTION
-
-
-def parse_retry_after(header_value: Optional[str]) -> Optional[float]:
-    """Parse a Retry-After header into fractional seconds.
-
-    Supports both integer seconds (RFC 7231 §7.1.3) and HTTP-date timestamps.
-    Returns None if missing or malformed.
-    """
-    if not header_value:
-        return None
-    val = header_value.strip()
-
-    # Try numeric seconds
-    try:
-        seconds = float(val)
-        return max(0.0, seconds)
-    except ValueError:
-        pass
-
-    # Try HTTP-date
-    try:
-        dt = email.utils.parsedate_to_datetime(val)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        diff = (dt - now).total_seconds()
-        return max(0.0, diff)
-    except Exception:
-        return None
-
-
-def extract_debug_id(response: Optional[httpx.Response]) -> Optional[str]:
-    """Extract optional debug_id from response header or JSON body.
-
-    Never fabricates a synthetic debug ID.
-    """
-    if response is None:
-        return None
-
-    # Check case-insensitive header
-    header_debug_id = response.headers.get("paypal-debug-id")
-    if header_debug_id:
-        return header_debug_id.strip()
-
-    # Fallback: check JSON body attribute
-    try:
-        body = response.json()
-        if isinstance(body, dict) and "debug_id" in body and isinstance(body["debug_id"], str):
-            return body["debug_id"].strip()
-    except Exception:
-        pass
-
-    return None
 
 
 class PayPalRESTClient:
@@ -190,11 +139,14 @@ class PayPalRESTClient:
         declared_safety: Optional[OperationSafety] = None,
     ) -> httpx.Response:
         """Execute a PayPal REST request with strict operation safety and bounded retry controls."""
-        # 1. Enforce operation safety classification internally
-        safety = classify_operation_safety(method=method, path=path, declared_safety=declared_safety)
+        # 1. Validate request URL path strictly (reject absolute, scheme-relative, queries, fragments)
+        validated_path = validate_api_path(path)
+
+        # 2. Enforce operation safety classification internally
+        safety = classify_operation_safety(method=method, path=validated_path, declared_safety=declared_safety)
         is_mutating = safety in (OperationSafety.MUTATING_FINANCIAL, OperationSafety.MUTATING_SUBSCRIPTION)
 
-        # 2. Mutating operations are permitted exactly 1 attempt (ZERO retries)
+        # 3. Mutating operations are permitted exactly 1 attempt (ZERO retries)
         max_retries = 0 if is_mutating else self._settings.PAYPAL_MAX_RETRIES
 
         attempt = 0
@@ -210,11 +162,16 @@ class PayPalRESTClient:
             # Build request headers
             req_headers = {
                 "Accept": "application/json",
-                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
             }
             if headers:
-                req_headers.update(headers)
+                # Prevent caller-provided headers from overriding or duplicating Authorization
+                for k, v in headers.items():
+                    if k.lower() != "authorization":
+                        req_headers[k] = v
+
+            # Construct Authorization header internally from validated token
+            req_headers["Authorization"] = f"Bearer {access_token}"
 
             # Attach idempotency header if supplied (e.g. for capture)
             if request_id:
@@ -224,7 +181,7 @@ class PayPalRESTClient:
             try:
                 response = await self._client.request(
                     method=method,
-                    url=path,
+                    url=validated_path,
                     headers=req_headers,
                     json=data if data is not None else None,
                     params=params,
@@ -235,7 +192,7 @@ class PayPalRESTClient:
                     logger.error(
                         "Ambiguous transport failure during %s %s (request_id=%s): %s. ZERO automatic retries permitted.",
                         method,
-                        path,
+                        validated_path,
                         request_id,
                         str(transport_err),
                     )
@@ -252,7 +209,7 @@ class PayPalRESTClient:
                     logger.warning(
                         "Transient network error on %s %s (attempt %d/%d): %s. Backing off for %.2fs.",
                         method,
-                        path,
+                        validated_path,
                         attempt,
                         max_retries + 1,
                         str(transport_err),
@@ -262,7 +219,7 @@ class PayPalRESTClient:
                     continue
 
                 raise PayPalTransientError(
-                    message=f"Transient transport failure on {method} {path} after {attempt} attempts: {str(transport_err)}",
+                    message=f"Transient transport failure on {method} {validated_path} after {attempt} attempts: {str(transport_err)}",
                     status_code=504 if isinstance(transport_err, httpx.TimeoutException) else 503,
                     debug_id=None,
                 ) from transport_err
@@ -279,12 +236,12 @@ class PayPalRESTClient:
                 # SAFEGUARD: Allow at most ONE token refresh & retry on SAFE_READ only
                 if safety == OperationSafety.SAFE_READ and not refreshed_on_401:
                     refreshed_on_401 = True
-                    logger.warning("Received 401 on SAFE_READ %s. Invalidating token and retrying once.", path)
+                    logger.warning("Received 401 on SAFE_READ %s. Invalidating token and retrying once.", validated_path)
                     self._auth.invalidate()
                     continue
 
                 raise PayPalAuthError(
-                    message=f"PayPal API authentication failed (HTTP 401) on {method} {path}.",
+                    message=f"PayPal API authentication failed (HTTP 401) on {method} {validated_path}.",
                     status_code=401,
                     debug_id=debug_id,
                 )
@@ -298,7 +255,7 @@ class PayPalRESTClient:
                     logger.error(
                         "Received HTTP 429 on mutating operation %s %s (request_id=%s). ZERO automatic retries permitted.",
                         method,
-                        path,
+                        validated_path,
                         request_id,
                     )
                     raise PayPalRateLimitError(
@@ -328,7 +285,7 @@ class PayPalRESTClient:
                     logger.warning(
                         "Rate limited on %s %s (attempt %d/%d). Sleeping for %.2fs.",
                         method,
-                        path,
+                        validated_path,
                         attempt,
                         max_retries + 1,
                         delay,
@@ -337,7 +294,7 @@ class PayPalRESTClient:
                     continue
 
                 raise PayPalRateLimitError(
-                    message=f"PayPal rate limit reached on {method} {path} after {attempt} attempts.",
+                    message=f"PayPal rate limit reached on {method} {validated_path} after {attempt} attempts.",
                     status_code=429,
                     debug_id=debug_id,
                     retry_after=retry_after_delay,
@@ -345,13 +302,29 @@ class PayPalRESTClient:
 
             # --- HTTP 502, 503, 504 Transient Server Errors ---
             if response.status_code in (502, 503, 504):
-                if not is_mutating and retry_count < max_retries:
+                if is_mutating:
+                    logger.error(
+                        "Ambiguous HTTP %d response on mutating operation %s %s (request_id=%s). ZERO automatic retries permitted.",
+                        response.status_code,
+                        method,
+                        validated_path,
+                        request_id,
+                    )
+                    raise PayPalAmbiguousError(
+                        message=f"Ambiguous server response (HTTP {response.status_code}) during {safety.value}.",
+                        operation_safety=safety,
+                        request_id=request_id,
+                        debug_id=debug_id,
+                        status_code=response.status_code,
+                    )
+
+                if retry_count < max_retries:
                     delay = self._jitter_func(0, self._settings.PAYPAL_BACKOFF_FACTOR * (2 ** retry_count))
                     logger.warning(
                         "Transient HTTP %d error on %s %s (attempt %d/%d). Sleeping for %.2fs.",
                         response.status_code,
                         method,
-                        path,
+                        validated_path,
                         attempt,
                         max_retries + 1,
                         delay,
@@ -360,7 +333,7 @@ class PayPalRESTClient:
                     continue
 
                 raise PayPalTransientError(
-                    message=f"PayPal server error (HTTP {response.status_code}) on {method} {path}.",
+                    message=f"PayPal server error (HTTP {response.status_code}) on {method} {validated_path}.",
                     status_code=response.status_code,
                     debug_id=debug_id,
                 )
@@ -377,7 +350,7 @@ class PayPalRESTClient:
                     pass
 
                 raise PayPalBusinessError(
-                    message=f"PayPal business validation failed (HTTP 422) on {method} {path}.",
+                    message=f"PayPal business validation failed (HTTP 422) on {method} {validated_path}.",
                     status_code=422,
                     debug_id=debug_id,
                     error_name=err_name,
@@ -386,7 +359,7 @@ class PayPalRESTClient:
 
             # --- Default Client Error ---
             raise PayPalClientError(
-                message=f"PayPal API request failed (HTTP {response.status_code}) on {method} {path}.",
+                message=f"PayPal API request failed (HTTP {response.status_code}) on {method} {validated_path}.",
                 status_code=response.status_code,
                 debug_id=debug_id,
             )

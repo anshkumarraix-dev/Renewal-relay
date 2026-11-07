@@ -74,7 +74,7 @@ class PayPalBusinessError(PayPalClientError):
 
 
 class PayPalAmbiguousError(PayPalClientError):
-    """Raised when a mutating operation encounters an uncertain outcome (e.g. timeout or drop).
+    """Raised when a mutating operation encounters an uncertain outcome (e.g. timeout, drop, or 502/503/504).
 
     Indicates that the operation may or may not have been processed by PayPal.
     Never automatically retried; must be returned to the service layer for reconciliation.
@@ -86,11 +86,12 @@ class PayPalAmbiguousError(PayPalClientError):
         operation_safety: Any,
         request_id: Optional[str] = None,
         debug_id: Optional[str] = None,
+        status_code: Optional[int] = None,
         error_name: Optional[str] = "AMBIGUOUS_MUTATION_OUTCOME",
     ):
         super().__init__(
             message=message,
-            status_code=None,
+            status_code=status_code,
             debug_id=debug_id,
             error_name=error_name,
         )

@@ -5,13 +5,17 @@ Architectural Guarantees:
 - asyncio.Lock() serialization prevents race conditions during token refresh.
 - Tokens with expires_in <= safety_margin are used once and not cached.
 - Credentials and tokens are strictly kept out of logs and string representations.
+- Bounded retries for transient token acquisition failures (timeouts, network drops, HTTP 502/503/504, 429).
+- Bounded Retry-After ceiling enforcement.
+- Injectable sleeper and jitter functions for deterministic unit testing.
 - Reuses the shared application httpx.AsyncClient connection pool.
 """
 
 import time
 import asyncio
 import logging
-from typing import Optional, Tuple
+import random
+from typing import Optional, Tuple, Callable, Awaitable
 import httpx
 
 from app.core.config import Settings, settings as default_settings
@@ -21,6 +25,7 @@ from app.core.paypal.exceptions import (
     PayPalTransientError,
     PayPalClientError,
 )
+from app.core.paypal.utils import parse_retry_after, extract_debug_id
 
 logger = logging.getLogger("renewal_relay.paypal.auth")
 
@@ -28,11 +33,18 @@ logger = logging.getLogger("renewal_relay.paypal.auth")
 class PayPalAuthManager:
     """Manages OAuth 2.0 client credential tokens with in-memory thread/coroutine-safe caching."""
 
-    def __init__(self, settings: Optional[Settings] = None):
+    def __init__(
+        self,
+        settings: Optional[Settings] = None,
+        sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
+        jitter_func: Optional[Callable[[float, float], float]] = None,
+    ):
         self._settings = settings or default_settings
         self._access_token: Optional[str] = None
         self._expires_at: Optional[float] = None
         self._lock = asyncio.Lock()
+        self._sleeper = sleeper or asyncio.sleep
+        self._jitter_func = jitter_func or random.uniform
 
     def __repr__(self) -> str:
         cached = "yes" if self.has_valid_token() else "no"
@@ -83,7 +95,7 @@ class PayPalAuthManager:
             return self._access_token
 
     async def _fetch_token(self, client: httpx.AsyncClient) -> Tuple[str, int]:
-        """Perform OAuth 2.0 client credentials grant against PayPal sandbox endpoint."""
+        """Perform OAuth 2.0 client credentials grant against PayPal sandbox endpoint with bounded retries."""
         token_url = f"{self._settings.PAYPAL_BASE_URL}/v1/oauth2/token"
         client_id = self._settings.PAYPAL_CLIENT_ID
         client_secret = self._settings.PAYPAL_CLIENT_SECRET
@@ -100,70 +112,130 @@ class PayPalAuthManager:
         }
         data = {"grant_type": "client_credentials"}
 
-        try:
-            response = await client.post(
-                token_url,
-                headers=headers,
-                data=data,
-                auth=(client_id, client_secret),
-            )
-        except httpx.TimeoutException as exc:
-            raise PayPalTransientError(
-                message=f"Timeout requesting PayPal OAuth token: {str(exc)}",
-                status_code=504,
-            ) from exc
-        except httpx.NetworkError as exc:
-            raise PayPalTransientError(
-                message=f"Network error requesting PayPal OAuth token: {str(exc)}",
-                status_code=503,
-            ) from exc
+        max_retries = self._settings.PAYPAL_MAX_RETRIES
+        attempt = 0
 
-        # Extract optional debug_id from response
-        debug_id = response.headers.get("paypal-debug-id")
+        while True:
+            attempt += 1
+            retry_count = attempt - 1
 
-        if response.status_code == 200:
             try:
-                payload = response.json()
-            except Exception as exc:
-                raise PayPalClientError(
-                    message="Malformed JSON response from PayPal OAuth endpoint",
-                    status_code=200,
-                    debug_id=debug_id,
+                response = await client.post(
+                    token_url,
+                    headers=headers,
+                    data=data,
+                    auth=(client_id, client_secret),
+                )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if retry_count < max_retries:
+                    delay = self._jitter_func(0, self._settings.PAYPAL_BACKOFF_FACTOR * (2 ** retry_count))
+                    logger.warning(
+                        "Transient network failure requesting PayPal OAuth token (attempt %d/%d). Backing off for %.2fs.",
+                        attempt,
+                        max_retries + 1,
+                        delay,
+                    )
+                    await self._sleeper(delay)
+                    continue
+
+                status_code = 504 if isinstance(exc, httpx.TimeoutException) else 503
+                raise PayPalTransientError(
+                    message=f"Transient transport failure requesting PayPal OAuth token after {attempt} attempts: {str(exc)}",
+                    status_code=status_code,
+                    debug_id=None,
                 ) from exc
 
-            access_token = payload.get("access_token")
-            expires_in = payload.get("expires_in")
+            # Extract optional debug_id from response (never fabricated)
+            debug_id = extract_debug_id(response)
 
-            if not access_token or not isinstance(expires_in, (int, float)):
-                raise PayPalClientError(
-                    message="Invalid token response payload: missing access_token or expires_in",
-                    status_code=200,
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                except Exception as exc:
+                    raise PayPalClientError(
+                        message="Malformed JSON response from PayPal OAuth endpoint",
+                        status_code=200,
+                        debug_id=debug_id,
+                    ) from exc
+
+                access_token = payload.get("access_token")
+                expires_in = payload.get("expires_in")
+
+                if not access_token or not isinstance(expires_in, (int, float)):
+                    raise PayPalClientError(
+                        message="Invalid token response payload: missing access_token or expires_in",
+                        status_code=200,
+                        debug_id=debug_id,
+                    )
+
+                return access_token, int(expires_in)
+
+            # HTTP 401 Unauthorized: Invalid credentials - do NOT retry
+            if response.status_code == 401:
+                raise PayPalAuthError(
+                    message="PayPal OAuth authentication failed: invalid client credentials.",
+                    status_code=401,
                     debug_id=debug_id,
                 )
 
-            return access_token, int(expires_in)
+            # HTTP 429 Rate Limit: evaluate bounded Retry-After
+            if response.status_code == 429:
+                retry_after_delay = parse_retry_after(response.headers.get("retry-after"))
+                if retry_count < max_retries:
+                    if retry_after_delay is not None:
+                        if retry_after_delay > self._settings.PAYPAL_MAX_RETRY_AFTER_SECONDS:
+                            raise PayPalRateLimitError(
+                                message=(
+                                    f"PayPal OAuth rate limited: Retry-After ({retry_after_delay:.1f}s) exceeds "
+                                    f"configured ceiling ({self._settings.PAYPAL_MAX_RETRY_AFTER_SECONDS:.1f}s)."
+                                ),
+                                status_code=429,
+                                debug_id=debug_id,
+                                retry_after=retry_after_delay,
+                            )
+                        delay = retry_after_delay
+                    else:
+                        delay = self._jitter_func(0, self._settings.PAYPAL_BACKOFF_FACTOR * (2 ** retry_count))
 
-        if response.status_code == 401:
-            raise PayPalAuthError(
-                message="PayPal OAuth authentication failed: invalid client credentials.",
-                status_code=401,
-                debug_id=debug_id,
-            )
-        if response.status_code == 429:
-            raise PayPalRateLimitError(
-                message="PayPal OAuth rate limit reached.",
-                status_code=429,
-                debug_id=debug_id,
-            )
-        if response.status_code in (500, 502, 503, 504):
-            raise PayPalTransientError(
-                message=f"PayPal OAuth service unavailable (HTTP {response.status_code}).",
+                    logger.warning(
+                        "PayPal OAuth rate limited (attempt %d/%d). Sleeping for %.2fs.",
+                        attempt,
+                        max_retries + 1,
+                        delay,
+                    )
+                    await self._sleeper(delay)
+                    continue
+
+                raise PayPalRateLimitError(
+                    message=f"PayPal OAuth rate limit reached after {attempt} attempts.",
+                    status_code=429,
+                    debug_id=debug_id,
+                    retry_after=retry_after_delay,
+                )
+
+            # HTTP 500, 502, 503, 504: Transient server errors
+            if response.status_code in (500, 502, 503, 504):
+                if retry_count < max_retries:
+                    delay = self._jitter_func(0, self._settings.PAYPAL_BACKOFF_FACTOR * (2 ** retry_count))
+                    logger.warning(
+                        "Transient HTTP %d on PayPal OAuth token request (attempt %d/%d). Sleeping for %.2fs.",
+                        response.status_code,
+                        attempt,
+                        max_retries + 1,
+                        delay,
+                    )
+                    await self._sleeper(delay)
+                    continue
+
+                raise PayPalTransientError(
+                    message=f"PayPal OAuth service unavailable (HTTP {response.status_code}) after {attempt} attempts.",
+                    status_code=response.status_code,
+                    debug_id=debug_id,
+                )
+
+            # Non-retryable error
+            raise PayPalClientError(
+                message=f"Unexpected status from PayPal OAuth endpoint: {response.status_code}",
                 status_code=response.status_code,
                 debug_id=debug_id,
             )
-
-        raise PayPalClientError(
-            message=f"Unexpected status from PayPal OAuth endpoint: {response.status_code}",
-            status_code=response.status_code,
-            debug_id=debug_id,
-        )
