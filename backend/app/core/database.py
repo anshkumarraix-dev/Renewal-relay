@@ -1,6 +1,7 @@
 """Database connectivity, engine configuration, and session management.
 
-Uses SQLite for initial local development with SQLAlchemy 2.0.
+Supports both SQLite (local development and automated tests) and
+PostgreSQL / Supabase (production deployment on Railway / Supabase).
 """
 
 import time
@@ -14,16 +15,31 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Normalize PostgreSQL URL if provided in Heroku / Supabase 'postgres://' format
+raw_db_url = settings.DATABASE_URL
+if raw_db_url.startswith("postgres://"):
+    database_url = raw_db_url.replace("postgres://", "postgresql://", 1)
+else:
+    database_url = raw_db_url
+
 # Configure engine arguments based on database dialect
 connect_args = {}
-if settings.DATABASE_URL.startswith("sqlite"):
+engine_kwargs = {
+    "pool_pre_ping": True,
+    "echo": False,
+}
+
+if database_url.startswith("sqlite"):
     connect_args["check_same_thread"] = False
+    engine_kwargs["connect_args"] = connect_args
+else:
+    # PostgreSQL / Supabase pooler settings
+    engine_kwargs["pool_size"] = 10
+    engine_kwargs["max_overflow"] = 20
 
 engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args,
-    pool_pre_ping=True,
-    echo=False,
+    database_url,
+    **engine_kwargs,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -40,7 +56,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def check_database_health(session: Optional[Session] = None) -> Tuple[bool, float, Optional[str]]:
-    """Execute a real connectivity check against the SQLite database using SQLAlchemy.
+    """Execute a real connectivity check against the database using SQLAlchemy.
 
     Returns:
         Tuple of (is_connected, latency_ms, error_detail)
@@ -53,7 +69,6 @@ def check_database_health(session: Optional[Session] = None) -> Tuple[bool, floa
         own_session = True
 
     try:
-        # Perform real query using text()
         result = session.execute(text("SELECT 1")).scalar()
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         if result == 1:
@@ -73,10 +88,12 @@ def check_database_health(session: Optional[Session] = None) -> Tuple[bool, floa
 
 
 def init_db() -> None:
-    """Initialize database tables."""
+    """Initialize all registered database tables."""
     try:
+        # Import all models to ensure they are registered with Base.metadata
+        import app.models  # noqa: F401
         Base.metadata.create_all(bind=engine)
-        logger.info("Database initialized successfully at %s", settings.DATABASE_URL)
+        logger.info("Database initialized successfully at %s", database_url)
     except Exception as exc:
         logger.error("Failed to initialize database: %s", str(exc))
         raise

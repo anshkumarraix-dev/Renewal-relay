@@ -1,5 +1,5 @@
 # Renewal Relay Backend Dependencies
-# Python 3.14 compatible
+# Python 3.14 compatible, Railway & Supabase ready
 
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
@@ -8,3 +8,4 @@ pydantic-settings>=2.4.0
 python-dotenv>=1.0.0
 sqlalchemy>=2.0.0
 httpx>=0.27.0
+psycopg2-binary>=2.9.9
